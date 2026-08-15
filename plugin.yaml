@@ -1,0 +1,14 @@
+schema: mcpg.dev/plugin/v1
+id: dev.mcpg.webhook
+name: Webhook Notifications
+license: Apache-2.0
+description: |
+  Emits outbound webhook notifications for tool-call lifecycle
+  events (start / complete / deny). Fire-and-forget with a bounded
+  retry queue; does not participate in the request decision.
+class: tool_gate
+runtime: native-cdylib-v1
+protocol_version: "1.0"
+required_capabilities:
+  # Fire-and-forget outbound HTTP POST to configured endpoints.
+  - network_outbound
