@@ -1,18 +1,28 @@
 use std::collections::HashMap;
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tracing::{info, info_span, warn};
+use mcpg_standard_webhooks::{HEADER_ID, HEADER_TIMESTAMP, WhsecSecret, sign_message};
+use reqwest::StatusCode;
+use reqwest::header::{HeaderMap, HeaderValue};
+use tracing::{error, info, info_span, warn};
 
-use crate::{EndpointConfig, WebhookEvent, WebhookPluginConfig};
+use crate::{EndpointConfig, Outgoing, WebhookPluginConfig};
 
 /// Per-endpoint circuit breaker state machine. Each endpoint URL has its
 /// own breaker so a single broken receiver cannot throttle healthy ones.
 #[derive(Debug, Clone)]
 enum CircuitState {
-    Closed { consecutive_failures: u32 },
-    Open { until: Instant },
-    HalfOpen { probes_remaining: u32 },
+    Closed {
+        consecutive_failures: u32,
+    },
+    Open {
+        until: Instant,
+    },
+    HalfOpen {
+        probes_remaining: u32,
+        since: Instant,
+    },
 }
 
 impl CircuitState {
@@ -25,27 +35,41 @@ impl CircuitState {
     }
 }
 
+/// What one attempt's answer means for the delivery.
+enum Attempt {
+    Delivered,
+    /// Stop: the receiver answered, but refused this event, or the
+    /// endpoint, for good.
+    Stop,
+    /// Try again after a backoff; `server_side` counts against the breaker.
+    Retry {
+        server_side: bool,
+    },
+}
+
 /// Background task that receives webhook events and delivers them via HTTP.
 /// Each endpoint URL has its own circuit breaker (Closed -> Open -> HalfOpen)
 /// so a single broken receiver cannot throttle healthy ones. Retries use
 /// exponential backoff with jitter, clamped to prevent multi-minute sleeps.
 pub struct BackgroundSender {
-    config: WebhookPluginConfig,
-    rx: mpsc::Receiver<(WebhookEvent, Vec<EndpointConfig>)>,
+    config: Arc<WebhookPluginConfig>,
+    rx: mpsc::Receiver<Outgoing>,
     breakers: HashMap<String, CircuitState>,
+    /// Endpoints that answered `410 Gone`, by index. They get nothing more
+    /// until the plugin is loaded again.
+    gone: Vec<bool>,
 }
 
 impl BackgroundSender {
-    pub fn new(
-        config: WebhookPluginConfig,
-        rx: mpsc::Receiver<(WebhookEvent, Vec<EndpointConfig>)>,
-    ) -> Self {
+    pub(crate) fn new(config: Arc<WebhookPluginConfig>, rx: mpsc::Receiver<Outgoing>) -> Self {
         // The HTTP client is built per delivery inside `deliver_with_retry`
         // so the resolved+validated address can be pinned (SSRF guard).
+        let gone = vec![false; config.endpoints.len()];
         Self {
             config,
             rx,
             breakers: HashMap::new(),
+            gone,
         }
     }
 
@@ -54,17 +78,16 @@ impl BackgroundSender {
         // iteration, unlike `iter()` which borrows `self.rx` for the
         // entire loop lifetime — the latter conflicts with the
         // `&mut self` call to `deliver_with_retry` below.
-        while let Ok((event, endpoints)) = self.rx.recv() {
-            for endpoint in endpoints {
-                let payload = match serde_json::to_vec(&event) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warn!(error = %e, "failed to serialize webhook event");
-                        continue;
-                    }
-                };
-
-                self.deliver_with_retry(&endpoint, &payload);
+        while let Ok(outgoing) = self.rx.recv() {
+            let payload = match serde_json::to_vec(&outgoing.event) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(error = %e, "failed to serialize webhook event");
+                    continue;
+                }
+            };
+            for index in outgoing.endpoints {
+                self.deliver_with_retry(index, &outgoing.msg_id, &payload);
             }
         }
         info!("webhook background sender shutting down");
@@ -74,6 +97,7 @@ impl BackgroundSender {
     /// In Open state, transitions to HalfOpen once the cooldown expires.
     fn breaker_allow(&mut self, url: &str) -> bool {
         let cb = &self.config.circuit_breaker;
+        let open_for = Duration::from_millis(cb.open_duration_ms.max(1));
         let entry = self
             .breakers
             .entry(url.to_owned())
@@ -87,6 +111,7 @@ impl BackgroundSender {
                 if Instant::now() >= *until {
                     *entry = CircuitState::HalfOpen {
                         probes_remaining: cb.half_open_probe_count.max(1),
+                        since: Instant::now(),
                     };
                     Self::record_state(url, entry);
                     true
@@ -94,7 +119,16 @@ impl BackgroundSender {
                     false
                 }
             }
-            CircuitState::HalfOpen { probes_remaining } => {
+            CircuitState::HalfOpen {
+                probes_remaining,
+                since,
+            } => {
+                // Deliveries run one at a time, so spent probes here ended
+                // without a verdict; admit new ones after another cooldown.
+                if *probes_remaining == 0 && since.elapsed() >= open_for {
+                    *probes_remaining = cb.half_open_probe_count.max(1);
+                    *since = Instant::now();
+                }
                 if *probes_remaining > 0 {
                     *probes_remaining -= 1;
                     true
@@ -230,28 +264,38 @@ impl BackgroundSender {
             })
     }
 
-    /// Deliver a webhook event to an endpoint with circuit breaker gating,
-    /// exponential backoff retry, and DNS rebinding protection on responses.
-    fn deliver_with_retry(&mut self, endpoint: &EndpointConfig, payload: &[u8]) {
+    /// Deliver one event to the endpoint at `index` with circuit breaker
+    /// gating, exponential backoff retry, and DNS rebinding protection on
+    /// responses. Every attempt carries `msg_id` and its own timestamp and
+    /// signature.
+    fn deliver_with_retry(&mut self, index: usize, msg_id: &str, payload: &[u8]) {
+        let config = Arc::clone(&self.config);
+        let Some(endpoint) = config.endpoints.get(index) else {
+            return;
+        };
+        if self.gone.get(index).copied().unwrap_or(false) {
+            return;
+        }
         // The gateway substitutes `${env.X}` / `cred://…` in the
         // endpoint config at load, so URL and headers arrive already
         // resolved and are used verbatim.
-        let url = endpoint.url.clone();
+        let url = endpoint.url.as_str();
 
         // Wrap delivery in a plugin-scoped span so operators can
         // correlate per-endpoint retry / outcome events with the
-        // originating webhook event.
+        // originating webhook event. The span names the endpoint by its
+        // index: every line logged inside it carries the span's fields.
         let _delivery_span = info_span!(
             "webhook_deliver",
             plugin_id = "dev.mcpg.integration.webhook",
-            endpoint = %url,
+            endpoint_index = index,
         )
         .entered();
 
-        if !self.breaker_allow(&url) {
+        if !self.breaker_allow(url) {
             metrics::counter!(
                 "mcpg_webhook_circuit_short_circuited_total",
-                "endpoint" => url.clone(),
+                "endpoint" => url.to_owned(),
             )
             .increment(1);
             return;
@@ -261,7 +305,7 @@ impl BackgroundSender {
         // per-delivery client (redirects disabled), so a DNS rebind or a 30x
         // to an internal host cannot reach a private address. Fail closed
         // before any send unless the endpoint opts into private targets.
-        let client = match self.build_pinned_client(&url, endpoint.allow_private_backends) {
+        let client = match self.build_pinned_client(url, endpoint.allow_private_backends) {
             Some(client) => client,
             None => return,
         };
@@ -269,14 +313,23 @@ impl BackgroundSender {
         let mut attempt = 0u32;
 
         loop {
+            let Some(webhook_headers) = webhook_headers(endpoint, msg_id, unix_now(), payload)
+            else {
+                warn!(
+                    endpoint_index = index,
+                    "webhook: message id is not header-safe; dropping event"
+                );
+                return;
+            };
             let mut req = client
-                .post(&url)
+                .post(url)
                 .header("content-type", "application/json")
                 .body(payload.to_vec());
 
             for (k, v) in &endpoint.headers {
                 req = req.header(k.as_str(), v.as_str());
             }
+            req = req.headers(webhook_headers);
 
             // Per-attempt latency histogram so operators can spot
             // endpoints whose response time degrades before they
@@ -286,10 +339,10 @@ impl BackgroundSender {
             let elapsed_ms = req_started.elapsed().as_millis() as f64;
             metrics::histogram!(
                 "mcpg_webhook_request_duration_ms",
-                "endpoint" => url.clone(),
+                "endpoint" => url.to_owned(),
             )
             .record(elapsed_ms);
-            let is_5xx = match response {
+            let outcome = match response {
                 Ok(resp) => {
                     // Security: DNS rebinding guard — reject delivery to private IPs.
                     if let Err(e) = mcpg_plugin_protocol::security::check_response_remote_addr(
@@ -299,23 +352,12 @@ impl BackgroundSender {
                         warn!(url = %url, error = %e, "webhook DNS rebinding blocked");
                         metrics::counter!(
                             "mcpg_dns_rebinding_blocked_total",
-                            "host" => url.clone(),
+                            "host" => url.to_owned(),
                         )
                         .increment(1);
                         return;
                     }
-                    if resp.status().is_success() {
-                        self.record_success(&url);
-                        return;
-                    }
-                    let status = resp.status();
-                    warn!(
-                        url = %url,
-                        status = %status,
-                        attempt = attempt + 1,
-                        "webhook delivery failed"
-                    );
-                    status.is_server_error()
+                    self.judge(index, resp.status(), attempt)
                 }
                 Err(e) => {
                     warn!(
@@ -325,12 +367,21 @@ impl BackgroundSender {
                         "webhook delivery error"
                     );
                     // Treat network-level errors as 5xx-equivalent for the breaker.
-                    true
+                    Attempt::Retry { server_side: true }
                 }
             };
 
-            if is_5xx {
-                self.record_failure(&url);
+            match outcome {
+                // Either way the receiver answered, so the endpoint is up.
+                Attempt::Delivered | Attempt::Stop => {
+                    self.record_success(url);
+                    return;
+                }
+                Attempt::Retry { server_side } => {
+                    if server_side {
+                        self.record_failure(url);
+                    }
+                }
             }
 
             attempt += 1;
@@ -361,117 +412,90 @@ impl BackgroundSender {
             let sleep_ms = (base as i64 + jitter).max(1) as u64;
             metrics::histogram!(
                 "mcpg_webhook_backoff_applied_ms",
-                "endpoint" => url.clone(),
+                "endpoint" => url.to_owned(),
             )
             .record(sleep_ms as f64);
             std::thread::sleep(Duration::from_millis(sleep_ms));
         }
     }
+
+    /// Only a `2xx` delivers. `410 Gone` stops the endpoint, as Standard
+    /// Webhooks asks of a sender; `413` drops the event, since the same
+    /// bytes are always too large; anything else is retried.
+    fn judge(&mut self, index: usize, status: StatusCode, attempt: u32) -> Attempt {
+        if status.is_success() {
+            return Attempt::Delivered;
+        }
+        match status {
+            StatusCode::GONE => {
+                if let Some(gone) = self.gone.get_mut(index) {
+                    *gone = true;
+                }
+                error!(
+                    endpoint_index = index,
+                    "webhook endpoint answered 410 Gone; sending it nothing more until the \
+                     configuration reloads"
+                );
+                metrics::counter!(
+                    "mcpg_webhook_gone_total",
+                    "endpoint_index" => index.to_string(),
+                )
+                .increment(1);
+                Attempt::Stop
+            }
+            StatusCode::PAYLOAD_TOO_LARGE => {
+                warn!(
+                    endpoint_index = index,
+                    "webhook endpoint answered 413; dropping the event without a retry"
+                );
+                Attempt::Stop
+            }
+            _ => {
+                warn!(
+                    endpoint_index = index,
+                    status = %status,
+                    attempt = attempt + 1,
+                    "webhook delivery failed"
+                );
+                Attempt::Retry {
+                    server_side: status.is_server_error(),
+                }
+            }
+        }
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The Standard Webhooks headers of one attempt: `webhook-id` and
+/// `webhook-timestamp`, and `webhook-signature` when the endpoint has
+/// secrets. `None` when `msg_id` is not a valid id.
+fn webhook_headers(
+    endpoint: &EndpointConfig,
+    msg_id: &str,
+    timestamp: u64,
+    payload: &[u8],
+) -> Option<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    if endpoint.signing_secrets.is_empty() {
+        let id = HeaderValue::from_str(msg_id).ok()?;
+        headers.insert(HEADER_ID, id);
+        headers.insert(HEADER_TIMESTAMP, HeaderValue::from(timestamp));
+    } else {
+        let secrets: Vec<&WhsecSecret> = endpoint.signing_secrets.iter().collect();
+        sign_message(&secrets, msg_id, timestamp, payload)
+            .ok()?
+            .insert_into(&mut headers)
+            .ok()?;
+    }
+    Some(headers)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn circuit_opens_after_threshold_failures() {
-        let (_tx, rx) = mpsc::sync_channel(1);
-        let cfg = WebhookPluginConfig {
-            endpoints: vec![],
-            max_retries: 0,
-            retry_backoff_ms: 1,
-            timeout_ms: 1000,
-            buffer_size: 1,
-            circuit_breaker: crate::CircuitBreakerConfig {
-                consecutive_5xx_threshold: 3,
-                open_duration_ms: 60,
-                half_open_probe_count: 1,
-            },
-        };
-        let mut s = BackgroundSender::new(cfg, rx);
-        let url = "https://example.test/hook";
-
-        for _ in 0..3 {
-            assert!(s.breaker_allow(url));
-            s.record_failure(url);
-        }
-        assert!(
-            !s.breaker_allow(url),
-            "breaker should be Open after threshold"
-        );
-    }
-
-    #[test]
-    fn circuit_half_open_returns_to_closed_on_success() {
-        let (_tx, rx) = mpsc::sync_channel(1);
-        let cfg = WebhookPluginConfig {
-            endpoints: vec![],
-            max_retries: 0,
-            retry_backoff_ms: 1,
-            timeout_ms: 1000,
-            buffer_size: 1,
-            circuit_breaker: crate::CircuitBreakerConfig {
-                consecutive_5xx_threshold: 1,
-                open_duration_ms: 1,
-                half_open_probe_count: 1,
-            },
-        };
-        let mut s = BackgroundSender::new(cfg, rx);
-        let url = "https://example.test/hook";
-
-        assert!(s.breaker_allow(url));
-        s.record_failure(url);
-        // Force-expire the open window by rewriting the state directly.
-        s.breakers.insert(
-            url.to_owned(),
-            CircuitState::Open {
-                until: Instant::now() - Duration::from_secs(1),
-            },
-        );
-        // Next allow() should transition to HalfOpen and admit a probe.
-        assert!(s.breaker_allow(url));
-        s.record_success(url);
-        // Breaker should be closed again and admit traffic.
-        assert!(s.breaker_allow(url));
-    }
-
-    fn sender_for_pin_test() -> BackgroundSender {
-        let (_tx, rx) = mpsc::sync_channel(1);
-        BackgroundSender::new(WebhookPluginConfig::default(), rx)
-    }
-
-    #[test]
-    fn build_pinned_client_blocks_loopback_by_default() {
-        let s = sender_for_pin_test();
-        // 127.0.0.1 is loopback → private; resolution+select must fail closed.
-        assert!(
-            s.build_pinned_client("http://127.0.0.1:9/hook", false)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn build_pinned_client_blocks_link_local_metadata_by_default() {
-        let s = sender_for_pin_test();
-        assert!(
-            s.build_pinned_client("http://169.254.169.254/latest/meta-data", false)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn build_pinned_client_opt_in_allows_loopback() {
-        let s = sender_for_pin_test();
-        // The escape hatch yields a usable (address-pinned) client.
-        assert!(
-            s.build_pinned_client("http://127.0.0.1:9/hook", true)
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn build_pinned_client_rejects_unparseable_url() {
-        let s = sender_for_pin_test();
-        assert!(s.build_pinned_client("not a url", false).is_none());
-    }
-}
+#[path = "sender_tests.rs"]
+mod tests;

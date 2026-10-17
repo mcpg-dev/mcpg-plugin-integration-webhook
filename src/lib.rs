@@ -1,14 +1,23 @@
 //! Webhook notifications plugin — fire-and-forget HTTP POST for
-//! tool-call lifecycle events. Ships as `native-cdylib-v1`.
+//! tool-call lifecycle events with Standard Webhooks headers, signed when
+//! the endpoint sets `signing_secrets`. Ships as `native-cdylib-v1`.
+
+use std::sync::Arc;
 
 use mcpg_plugin_protocol::{GateDecision, PluginClass, PluginContext, PluginManifest};
 use mcpg_plugin_sdk::declare_plugin;
 use mcpg_plugin_sdk::ffi::SyncToolGate;
+use mcpg_standard_webhooks::{HEADER_ID, HEADER_SIGNATURE, HEADER_TIMESTAMP, WhsecSecret};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const PLUGIN_ID: &str = "dev.mcpg.webhook";
 
+/// Headers the sender sets on every delivery; a static `headers` entry may
+/// not name one.
+const RESERVED_HEADERS: [&str; 3] = [HEADER_ID, HEADER_TIMESTAMP, HEADER_SIGNATURE];
+
+mod secrets;
 mod sender;
 
 // ---------------------------------------------------------------------------
@@ -93,6 +102,11 @@ pub struct EndpointConfig {
     pub slow_threshold_ms: Option<u64>,
     #[serde(default)]
     pub headers: std::collections::BTreeMap<String, String>,
+    /// Standard Webhooks secrets (`whsec_…`) that sign every delivery. The
+    /// first is the current one; the others also sign during a rotation.
+    /// Empty: deliveries carry `webhook-id` and `webhook-timestamp` only.
+    #[serde(default, deserialize_with = "secrets::deserialize")]
+    pub signing_secrets: Vec<WhsecSecret>,
     /// Opt-in: allow delivery to private/loopback/link-local addresses
     /// (SSRF-guard escape hatch for in-cluster receivers).
     #[serde(default)]
@@ -103,6 +117,40 @@ impl EndpointConfig {
     pub fn matches_event(&self, event: &str) -> bool {
         self.events.is_empty() || self.events.iter().any(|e| e == "all" || e == event)
     }
+}
+
+impl WebhookPluginConfig {
+    /// Checks serde cannot express. The error names an endpoint by its
+    /// index, never by its URL, which may carry a token.
+    pub fn validate(&self) -> Result<(), String> {
+        for (index, endpoint) in self.endpoints.iter().enumerate() {
+            if let Some(name) = endpoint.headers.keys().find(|name| {
+                RESERVED_HEADERS
+                    .iter()
+                    .any(|r| name.eq_ignore_ascii_case(r))
+            }) {
+                return Err(format!(
+                    "endpoints[{index}].headers sets `{name}`, which the plugin sets on every \
+                     delivery; remove it"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One event on its way to the background sender: the endpoints are
+/// indices into the shared config, so no key buffer is copied per event.
+pub(crate) struct Outgoing {
+    pub(crate) event: WebhookEvent,
+    /// `webhook-id`: the same on every endpoint and every retry.
+    pub(crate) msg_id: String,
+    pub(crate) endpoints: Vec<usize>,
+}
+
+/// A fresh `webhook-id`: `msg_` and a UUIDv7, which holds no `.`.
+fn new_msg_id() -> String {
+    format!("msg_{}", uuid::Uuid::now_v7().simple())
 }
 
 // ---------------------------------------------------------------------------
@@ -138,9 +186,9 @@ pub enum WebhookEvent {
 // ---------------------------------------------------------------------------
 
 pub struct WebhookPlugin {
-    config: WebhookPluginConfig,
+    config: Arc<WebhookPluginConfig>,
     manifest: PluginManifest,
-    tx: std::sync::mpsc::SyncSender<(WebhookEvent, Vec<EndpointConfig>)>,
+    tx: std::sync::mpsc::SyncSender<Outgoing>,
 }
 
 impl WebhookPlugin {
@@ -154,10 +202,19 @@ impl WebhookPlugin {
             );
             config.max_retries = WEBHOOK_RETRY_HARD_CAP;
         }
+        for (index, endpoint) in config.endpoints.iter().enumerate() {
+            if endpoint.signing_secrets.is_empty() {
+                tracing::warn!(
+                    endpoint_index = index,
+                    "webhook endpoint has no signing_secrets; its deliveries are not signed"
+                );
+            }
+        }
+        let config = Arc::new(config);
         let buffer_size = config.buffer_size.max(1);
         let (tx, rx) = std::sync::mpsc::sync_channel(buffer_size);
 
-        let bg = sender::BackgroundSender::new(config.clone(), rx);
+        let bg = sender::BackgroundSender::new(Arc::clone(&config), rx);
         std::thread::Builder::new()
             .name("mcpg-webhook-sender".into())
             .spawn(move || bg.run())
@@ -194,7 +251,40 @@ impl WebhookPlugin {
     pub fn from_config_json(config_json: &str) -> Self {
         let config: WebhookPluginConfig =
             mcpg_plugin_sdk::fail_closed_config!(config_json, WebhookPluginConfig);
+        if let Err(e) = config.validate() {
+            panic!(
+                "plugin config rejected (failing closed) for `{}`: {e}",
+                std::any::type_name::<WebhookPluginConfig>()
+            );
+        }
         Self::new(config)
+    }
+
+    /// Queue `event` for the endpoints at `endpoints`, under a fresh
+    /// `webhook-id`. A full queue drops it and counts the drop.
+    fn enqueue(&self, event: WebhookEvent, endpoints: Vec<usize>) {
+        if endpoints.is_empty() {
+            return;
+        }
+        let outgoing = Outgoing {
+            event,
+            msg_id: new_msg_id(),
+            endpoints,
+        };
+        if self.tx.try_send(outgoing).is_err() {
+            metrics::counter!("mcpg_webhook_dropped_events_total").increment(1);
+        }
+    }
+
+    /// Indices of the endpoints whose filter takes `event`.
+    fn matching(&self, event: &str) -> Vec<usize> {
+        self.config
+            .endpoints
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.matches_event(event))
+            .map(|(index, _)| index)
+            .collect()
     }
 }
 
@@ -260,7 +350,7 @@ impl SyncToolGate for WebhookPlugin {
             .unwrap_or(false);
 
         // Check for slow responses
-        for endpoint in &self.config.endpoints {
+        for (index, endpoint) in self.config.endpoints.iter().enumerate() {
             if let Some(threshold) = endpoint.slow_threshold_ms
                 && duration_ms > threshold
                 && endpoint.matches_event("slow_response")
@@ -271,9 +361,7 @@ impl SyncToolGate for WebhookPlugin {
                     duration_ms,
                     threshold_ms: threshold,
                 };
-                if self.tx.try_send((event, vec![endpoint.clone()])).is_err() {
-                    metrics::counter!("mcpg_webhook_dropped_events_total").increment(1);
-                }
+                self.enqueue(event, vec![index]);
             }
         }
 
@@ -293,16 +381,7 @@ impl SyncToolGate for WebhookPlugin {
                 error_message,
                 identity_kind: ctx.identity.kind.clone(),
             };
-            let matching: Vec<_> = self
-                .config
-                .endpoints
-                .iter()
-                .filter(|e| e.matches_event("error"))
-                .cloned()
-                .collect();
-            if !matching.is_empty() && self.tx.try_send((event, matching)).is_err() {
-                metrics::counter!("mcpg_webhook_dropped_events_total").increment(1);
-            }
+            self.enqueue(event, self.matching("error"));
         } else {
             let event = WebhookEvent::ToolCallCompleted {
                 tool_name: ctx.tool_name.clone(),
@@ -311,16 +390,7 @@ impl SyncToolGate for WebhookPlugin {
                 identity_kind: ctx.identity.kind.clone(),
                 subject_id: ctx.identity.subject_id.clone(),
             };
-            let matching: Vec<_> = self
-                .config
-                .endpoints
-                .iter()
-                .filter(|e| e.matches_event("completed") || e.matches_event("all"))
-                .cloned()
-                .collect();
-            if !matching.is_empty() && self.tx.try_send((event, matching)).is_err() {
-                metrics::counter!("mcpg_webhook_dropped_events_total").increment(1);
-            }
+            self.enqueue(event, self.matching("completed"));
         }
 
         GateDecision::allow()
@@ -374,6 +444,7 @@ mod tests {
             events: vec!["all".to_owned()],
             slow_threshold_ms: None,
             headers: Default::default(),
+            signing_secrets: vec![],
             allow_private_backends: false,
         };
         assert!(ep.matches_event("error"));
@@ -387,6 +458,7 @@ mod tests {
             events: vec!["error".to_owned()],
             slow_threshold_ms: None,
             headers: Default::default(),
+            signing_secrets: vec![],
             allow_private_backends: false,
         };
         assert!(ep.matches_event("error"));
@@ -400,6 +472,7 @@ mod tests {
             events: vec![],
             slow_threshold_ms: None,
             headers: Default::default(),
+            signing_secrets: vec![],
             allow_private_backends: false,
         };
         assert!(ep.matches_event("anything"));
@@ -529,5 +602,68 @@ mod tests {
             r#"{"circuit_breaker": {"open_duration_ms": 100, "open_durtaion_ms": 1}}"#,
         );
         assert!(err.is_err(), "unknown circuit_breaker key must be rejected");
+    }
+
+    const WHSEC: &str = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw";
+
+    /// The panic text of a factory call that refuses `config_json`.
+    fn refusal(config_json: &str) -> String {
+        let panic = std::panic::catch_unwind(|| WebhookPlugin::from_config_json(config_json))
+            .err()
+            .expect("the config is refused");
+        panic.downcast_ref::<String>().cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn signing_secrets_load_from_a_file_value_with_a_newline() {
+        let plugin = WebhookPlugin::from_config_json(&format!(
+            r#"{{"endpoints": [{{"url": "https://hooks.example.com/a", "signing_secrets": ["{WHSEC}\n"]}}]}}"#
+        ));
+        let secrets = &plugin.config.endpoints[0].signing_secrets;
+        assert_eq!(secrets.len(), 1);
+        assert!(secrets[0].same_key(&WhsecSecret::parse(WHSEC).unwrap()));
+    }
+
+    #[test]
+    fn a_bad_signing_secret_is_refused_without_its_value() {
+        for config in [
+            format!(r#"{{"endpoints": [{{"url": "https://h.example", "signing_secrets": "{WHSEC}"}}]}}"#),
+            format!(r#"{{"endpoints": [{{"url": "https://h.example", "signing_secrets": [{{"v": "{WHSEC}"}}]}}]}}"#),
+            r#"{"endpoints": [{"url": "https://h.example", "signing_secrets": ["whsec_MfKQ9r8GKYqr"]}]}"#
+                .to_owned(),
+        ] {
+            let text = refusal(&config);
+            assert!(text.contains("failing closed"), "{text}");
+            assert!(text.contains("signing_secrets"), "{text}");
+            assert!(!text.contains("MfKQ9r8G"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_static_header_may_not_name_a_webhook_header() {
+        for name in ["webhook-id", "Webhook-Timestamp", "WEBHOOK-SIGNATURE"] {
+            let text = refusal(&format!(
+                r#"{{"endpoints": [{{"url": "https://h.example/?token=t0k", "headers": {{"{name}": "x"}}}}]}}"#
+            ));
+            assert!(text.contains("failing closed"), "{text}");
+            assert!(text.contains("endpoints[0].headers"), "{text}");
+            assert!(!text.contains("t0k"), "{text}");
+        }
+        let fine: WebhookPluginConfig = serde_json::from_str(
+            r#"{"endpoints": [{"url": "https://h.example", "headers": {"Webhook-Source": "mcpg"}}]}"#,
+        )
+        .unwrap();
+        assert!(fine.validate().is_ok());
+    }
+
+    #[test]
+    fn message_ids_are_header_safe_and_fresh() {
+        let (a, b) = (new_msg_id(), new_msg_id());
+        assert_ne!(a, b);
+        for id in [a, b] {
+            assert!(id.starts_with("msg_"), "{id}");
+            assert_eq!(id.len(), 4 + 32, "{id}");
+            assert!(!id.contains('.'), "{id}");
+        }
     }
 }
