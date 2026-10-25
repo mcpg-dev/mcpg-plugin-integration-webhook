@@ -1,6 +1,6 @@
 [package]
 name = "mcpg-plugin-integration-webhook"
-version = "0.1.0-alpha.47"
+version = "0.1.0-alpha.48"
 license = "Apache-2.0"
 edition = "2024"
 description = "Webhook notification plugin for MCPG gateway — fire-and-forget HTTP POST for tool call lifecycle events with Standard Webhooks headers, signed when the endpoint sets signing_secrets"
@@ -9,8 +9,8 @@ description = "Webhook notification plugin for MCPG gateway — fire-and-forget 
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.45", version = "=0.1.0-beta.45" }
-mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.46", version = "=0.1.0-beta.46" }
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.46", version = "=0.1.0-beta.46" }
+mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.47", version = "=0.1.0-beta.47" }
 # Standard Webhooks signing: whsec_ secrets and the webhook-* headers.
 mcpg-standard-webhooks = { git = "https://github.com/mcpg-dev/mcpg-standard-webhooks", tag = "v0.1.0-beta.4", version = "=0.1.0-beta.4" }
 # `blocking` feature: webhook sends run on a dedicated std::thread
